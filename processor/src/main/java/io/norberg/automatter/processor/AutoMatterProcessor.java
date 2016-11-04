@@ -2,6 +2,7 @@ package io.norberg.automatter.processor;
 
 import com.google.auto.service.AutoService;
 import com.google.common.base.Joiner;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
 
@@ -157,7 +158,83 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     builder.addMethod(fromValue(d));
     builder.addMethod(fromBuilder(d));
 
+    builder.addType(safeBuilder(d));
+
     builder.addType(valueClass(d));
+
+    return builder.build();
+  }
+
+  private List<TypeVariableName> safetyTypeVariables(final Descriptor d, boolean allOrFirstUpper) {
+    // FIXME: kill allOrFirstUpper!!!!!
+    TypeName definedInterfaceName = ClassName.get(
+        d.packageName(), d.builderName(), "SafeBuilder", "Defined");
+
+    ImmutableList.Builder<TypeVariableName> types = ImmutableList.builder();
+    for (ExecutableElement field : d.fields()) {
+      if (!isOptional(field) && !isNullableAnnotated(field) && !isCollection(field) && !isMap(field)) {
+        // TODO: proper UPPER_CASE_WITH_UNDERSCORE conversion
+        final String baseName = allOrFirstUpper ? fieldName(field).toUpperCase() : capitalizeFirstLetter(fieldName(field));
+        types.add(TypeVariableName.get(baseName, definedInterfaceName));
+      }
+    }
+    return types.build();
+  }
+
+  private String safetyTypeVariableName(final String fieldName, final boolean defined) {
+    // TODO: proper UPPER_CASE_WITH_UNDERSCORE conversion
+    return capitalizeFirstLetter(fieldName) + (defined ? "Defined" : "NotDefined");
+  }
+
+  /**
+   * Builder with compile-time checks of required fields.
+   * From http://www.radicaljava.com/2016/09/19/safe-builder.html
+   */
+  private TypeSpec safeBuilder(final Descriptor d) throws AutoMatterProcessorException {
+
+    TypeSpec.Builder builder = TypeSpec.classBuilder("SafeBuilder")
+        .addTypeVariables(
+            ImmutableList.<TypeVariableName>builder()
+                .addAll(d.typeVariables())
+                .addAll(safetyTypeVariables(d, true))
+                .build())
+        .addModifiers(STATIC, FINAL);
+
+    if (d.isPublic()) {
+      builder.addModifiers(PUBLIC);
+    }
+
+    List<String> l = ImmutableList.of("x");
+
+    if (!safetyTypeVariables(d, false).isEmpty()) {
+      TypeSpec.Builder interfaceTypeBuilder = TypeSpec.interfaceBuilder("Defined");
+      TypeName interfaceTypeName = ClassName.get(d.packageName(), d.builderName(), "SafeBuilder", "Defined");
+      builder.addType(interfaceTypeBuilder.build());
+      for (TypeVariableName safetyTypeVariable : safetyTypeVariables(d, false)) {
+        TypeSpec.Builder interfaceDefinedBuilder =
+            TypeSpec.interfaceBuilder(safetyTypeVariableName(safetyTypeVariable.name, true));
+        interfaceDefinedBuilder.addSuperinterface(interfaceTypeName);
+        builder.addType(interfaceDefinedBuilder.build());
+        TypeSpec.Builder interfaceUndefinedBuilder =
+            TypeSpec.interfaceBuilder(safetyTypeVariableName(safetyTypeVariable.name, false));
+        interfaceUndefinedBuilder.addSuperinterface(interfaceTypeName);
+        builder.addType(interfaceUndefinedBuilder.build());
+      }
+    }
+
+    for (ExecutableElement field : d.fields()) {
+      builder.addField(FieldSpec.builder(fieldType(d, field), fieldName(field), PRIVATE).build());
+    }
+
+    builder.addMethod(defaultConstructor(d));
+
+    for (MethodSpec accessor : safeAccessors(d)) {
+      builder.addMethod(accessor);
+    }
+
+    // TODO: private build
+    builder.addMethod(build(d));
+    builder.addMethod(safeBuild(d));
 
     return builder.build();
   }
@@ -248,35 +325,73 @@ public final class AutoMatterProcessor extends AbstractProcessor {
 
   private Set<MethodSpec> accessors(final Descriptor d) throws AutoMatterProcessorException {
     ImmutableSet.Builder<MethodSpec> result = ImmutableSet.builder();
+    final TypeName builderType = builderType(d);
     for (ExecutableElement field : d.fields()) {
       result.add(getter(d, field));
 
       if (isOptional(field)) {
-        result.add(optionalRawSetter(d, field));
-        result.add(optionalSetter(d, field));
+        result.add(optionalRawSetter(d, field, builderType));
+        result.add(optionalSetter(d, field, builderType));
       } else if (isCollection(field)) {
-        result.add(collectionSetter(d, field));
-        result.add(collectionCollectionSetter(d, field));
-        result.add(collectionIterableSetter(d, field));
-        result.add(collectionIteratorSetter(d, field));
-        result.add(collectionVarargSetter(d, field));
+        result.add(collectionSetter(d, field, builderType));
+        result.add(collectionCollectionSetter(d, field, builderType));
+        result.add(collectionIterableSetter(d, field, builderType));
+        result.add(collectionIteratorSetter(d, field, builderType));
+        result.add(collectionVarargSetter(d, field, builderType));
 
-        MethodSpec adder = collectionAdder(d, field);
+        MethodSpec adder = collectionAdder(d, field, builderType);
         if (adder != null) {
           result.add(adder);
         }
       } else if (isMap(field)) {
-        result.add(mapSetter(d, field));
+        result.add(mapSetter(d, field, builderType));
         for (int i = 1; i <= 5; i++) {
-          result.add(mapSetterPairs(d, field, i));
+          result.add(mapSetterPairs(d, field, i, builderType));
         }
 
-        MethodSpec putter = mapPutter(d, field);
+        MethodSpec putter = mapPutter(d, field, builderType);
         if (putter != null) {
           result.add(putter);
         }
       } else {
         result.add(setter(d, field));
+      }
+    }
+    return result.build();
+  }
+
+  private Set<MethodSpec> safeAccessors(final Descriptor d) throws AutoMatterProcessorException {
+    ImmutableSet.Builder<MethodSpec> result = ImmutableSet.builder();
+    final TypeName builderType = safeBuilderType(d);
+    for (ExecutableElement field : d.fields()) {
+      result.add(getter(d, field));
+
+      if (isOptional(field)) {
+        result.add(optionalRawSetter(d, field, builderType));
+        result.add(optionalSetter(d, field, builderType));
+      } else if (isCollection(field)) {
+        result.add(collectionSetter(d, field, builderType));
+        result.add(collectionCollectionSetter(d, field, builderType));
+        result.add(collectionIterableSetter(d, field, builderType));
+        result.add(collectionIteratorSetter(d, field, builderType));
+        result.add(collectionVarargSetter(d, field, builderType));
+
+        MethodSpec adder = collectionAdder(d, field, builderType);
+        if (adder != null) {
+          result.add(adder);
+        }
+      } else if (isMap(field)) {
+        result.add(mapSetter(d, field, builderType));
+        for (int i = 1; i <= 5; i++) {
+          result.add(mapSetterPairs(d, field, i, builderType));
+        }
+
+        MethodSpec putter = mapPutter(d, field, builderType);
+        if (putter != null) {
+          result.add(putter);
+        }
+      } else {
+        result.add(safeSetter(d, field));
       }
     }
     return result.build();
@@ -299,7 +414,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return getter.build();
   }
 
-  private MethodSpec optionalRawSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec optionalRawSetter(final Descriptor d, final ExecutableElement field,
+                                       final TypeName builderType) {
     String fieldName = fieldName(field);
     ClassName type = ClassName.bestGuess(optionalType(field));
     TypeName valueType = genericArgument(field, 0);
@@ -307,12 +423,13 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(valueType, fieldName)
-        .returns(builderType(d))
+        .returns(builderType)
         .addStatement("return $N($T.$N($N))", fieldName, type, optionalMaybeName(field), fieldName)
         .build();
   }
 
-  private MethodSpec optionalSetter(final Descriptor d, final ExecutableElement field)
+  private MethodSpec optionalSetter(final Descriptor d, final ExecutableElement field,
+                                    final TypeName builderType)
       throws AutoMatterProcessorException {
     String fieldName = fieldName(field);
     TypeName valueType = genericArgument(field, 0);
@@ -327,7 +444,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
         .addAnnotation(suppressUncheckedAnnotation)
         .addModifiers(PUBLIC)
         .addParameter(parameterType, fieldName)
-        .returns(builderType(d));
+        .returns(builderType);
 
     if (shouldEnforceNonNull(field)) {
       assertNotNull(setter, fieldName);
@@ -338,7 +455,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.addStatement("return this").build();
   }
 
-  private MethodSpec collectionSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionSetter(final Descriptor d, final ExecutableElement field,
+                                      final TypeName builderType) {
     String fieldName = fieldName(field);
     ClassName collectionType = collectionRawType(field);
     TypeName itemType = genericArgument(field, 0);
@@ -347,12 +465,13 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(ParameterizedTypeName.get(collectionType, extendedType), fieldName)
-        .returns(builderType(d))
+        .returns(builderType)
         .addStatement("return $N((Collection<$T>) $N)", fieldName, extendedType, fieldName)
         .build();
   }
 
-  private MethodSpec collectionCollectionSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionCollectionSetter(final Descriptor d, final ExecutableElement field,
+                                                final TypeName builderType) {
     String fieldName = fieldName(field);
     ClassName collectionType = ClassName.get(Collection.class);
     TypeName itemType = genericArgument(field, 0);
@@ -361,7 +480,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(ParameterizedTypeName.get(collectionType, extendedType), fieldName)
-        .returns(builderType(d));
+        .returns(builderType);
 
     collectionNullGuard(setter, field);
     if (shouldEnforceNonNull(field)) {
@@ -374,7 +493,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.addStatement("return this").build();
   }
 
-  private MethodSpec collectionIterableSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionIterableSetter(final Descriptor d, final ExecutableElement field,
+                                              final TypeName builderType) {
     String fieldName = fieldName(field);
     ClassName iterableType = ClassName.get(Iterable.class);
     TypeName itemType = genericArgument(field, 0);
@@ -383,7 +503,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(ParameterizedTypeName.get(iterableType, extendedType), fieldName)
-        .returns(builderType(d));
+        .returns(builderType);
 
     collectionNullGuard(setter, field);
 
@@ -396,7 +516,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.build();
   }
 
-  private MethodSpec collectionIteratorSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionIteratorSetter(final Descriptor d, final ExecutableElement field,
+                                              final TypeName builderType) {
     String fieldName = fieldName(field);
     ClassName iteratorType = ClassName.get(Iterator.class);
     TypeName itemType = genericArgument(field, 0);
@@ -405,7 +526,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(ParameterizedTypeName.get(iteratorType, extendedType), fieldName)
-        .returns(builderType(d));
+        .returns(builderType);
 
     collectionNullGuard(setter, field);
 
@@ -423,7 +544,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.addStatement("return this").build();
   }
 
-  private MethodSpec collectionVarargSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionVarargSetter(final Descriptor d, final ExecutableElement field,
+                                            final TypeName builderType) {
     String fieldName = fieldName(field);
     TypeName itemType = genericArgument(field, 0);
 
@@ -431,7 +553,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
         .addModifiers(PUBLIC)
         .addParameter(ArrayTypeName.of(itemType), fieldName)
         .varargs()
-        .returns(builderType(d));
+        .returns(builderType);
 
     ensureSafeVarargs(setter);
 
@@ -450,7 +572,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
         .addModifiers(FINAL); // Only because SafeVarargs can be applied to final methods.
   }
 
-  private MethodSpec collectionAdder(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec collectionAdder(final Descriptor d, final ExecutableElement field,
+                                     final TypeName builderType) {
     final String fieldName = fieldName(field);
     final String singular = singular(fieldName);
     if (singular == null || singular.isEmpty()) {
@@ -462,7 +585,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     MethodSpec.Builder adder = MethodSpec.methodBuilder(appendMethodName)
         .addModifiers(PUBLIC)
         .addParameter(itemType, singular)
-        .returns(builderType(d));
+        .returns(builderType);
 
     if (shouldEnforceNonNull(field)) {
       assertNotNull(adder, singular);
@@ -492,7 +615,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
         .endControlFlow();
   }
 
-  private MethodSpec mapSetter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec mapSetter(final Descriptor d, final ExecutableElement field,
+                               final TypeName builderType) {
     final String fieldName = fieldName(field);
     final TypeName keyType = subtypeOf(genericArgument(field, 0));
     final TypeName valueType = subtypeOf(genericArgument(field, 1));
@@ -501,7 +625,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
         .addParameter(paramType, fieldName)
-        .returns(builderType(d));
+        .returns(builderType);
 
     if (shouldEnforceNonNull(field)) {
       final String entryName = variableName("entry", fieldName);
@@ -524,7 +648,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.addStatement("return this").build();
   }
 
-  private MethodSpec mapSetterPairs(final Descriptor d, final ExecutableElement field, int entries) {
+  private MethodSpec mapSetterPairs(final Descriptor d, final ExecutableElement field, int entries,
+                                    final TypeName builderType) {
     checkArgument(entries > 0, "entries");
     final String fieldName = fieldName(field);
     final TypeName keyType = genericArgument(field, 0);
@@ -532,7 +657,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
 
     MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
         .addModifiers(PUBLIC)
-        .returns(builderType(d));
+        .returns(builderType);
 
     for (int i = 1; i < entries + 1; i++) {
       setter.addParameter(keyType, "k" + i);
@@ -568,7 +693,8 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return setter.addStatement("return this").build();
   }
 
-  private MethodSpec mapPutter(final Descriptor d, final ExecutableElement field) {
+  private MethodSpec mapPutter(final Descriptor d, final ExecutableElement field,
+                               final TypeName builderType) {
     final String fieldName = fieldName(field);
     final String singular = singular(fieldName);
     if (singular == null) {
@@ -583,7 +709,7 @@ public final class AutoMatterProcessor extends AbstractProcessor {
         .addModifiers(PUBLIC)
         .addParameter(keyType, "key")
         .addParameter(valueType, "value")
-        .returns(builderType(d));
+        .returns(builderType);
 
     // Null checks
     if (shouldEnforceNonNull(field)) {
@@ -619,6 +745,41 @@ public final class AutoMatterProcessor extends AbstractProcessor {
 
     setter.addStatement("this.$N = $N", fieldName, fieldName);
     return setter.addStatement("return this").build();
+  }
+
+  private MethodSpec safeSetter(final Descriptor d, final ExecutableElement field) throws AutoMatterProcessorException {
+    String fieldName = fieldName(field);
+
+    ImmutableList.Builder<TypeName> typeArguments = ImmutableList.builder();
+    typeArguments.addAll(Arrays.asList(d.typeArguments()));
+    for (TypeName safetyTypeArgument : safetyTypeVariables(d, true)) {
+      // TODO proper upper case, use method
+      if (safetyTypeArgument.toString().equals(fieldName.toUpperCase())) {
+        typeArguments.add(ClassName.get(
+            d.packageName(), d.builderName(), "SafeBuilder",
+            safetyTypeVariableName(fieldName, true)));
+      } else {
+        typeArguments.add(safetyTypeArgument);
+      }
+    }
+    TypeName updatedSafeType = ParameterizedTypeName.get(rawSafeBuilderType(d), typeArguments.build().toArray(new TypeName[0]));
+
+    MethodSpec.Builder setter = MethodSpec.methodBuilder(fieldName)
+        .addModifiers(PUBLIC)
+        .addParameter(fieldType(d, field), fieldName)
+        .returns(updatedSafeType);
+
+    if (shouldEnforceNonNull(field)) {
+      assertNotNull(setter, fieldName);
+    }
+
+    setter.addStatement("this.$N = $N", fieldName, fieldName);
+
+    setter.addStatement(
+        "@SuppressWarnings(\"unchecked\") final $T retypedThis = ($T) ($T) this",
+        updatedSafeType, updatedSafeType, rawSafeBuilderType(d)).build();
+
+    return setter.addStatement("return retypedThis").build();
   }
 
   private MethodSpec toBuilder(final Descriptor d) {
@@ -681,6 +842,50 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     }
 
     return build.addStatement("return new $T($N)", valueImplType(d), Joiner.on(", ").join(parameters)).build();
+  }
+
+  private MethodSpec safeBuild(final Descriptor d) throws AutoMatterProcessorException {
+    ImmutableList.Builder<TypeName> typeArgumentsUndefined = ImmutableList.builder();
+    ImmutableList.Builder<TypeName> typeArgumentsDefined = ImmutableList.builder();
+    typeArgumentsUndefined.addAll(Arrays.asList(d.typeArguments()));
+    typeArgumentsDefined.addAll(Arrays.asList(d.typeArguments()));
+    for (TypeName safetyTypeArgument : safetyTypeVariables(d, false)) {
+      // TODO proper upper case, use method
+      typeArgumentsUndefined.add(ClassName.get(
+          d.packageName(), d.builderName(), "SafeBuilder",
+          safetyTypeVariableName(safetyTypeArgument.toString(), false)));
+      typeArgumentsDefined.add(ClassName.get(
+          d.packageName(), d.builderName(), "SafeBuilder",
+          safetyTypeVariableName(safetyTypeArgument.toString(), true)));
+    }
+
+    final TypeName typeAllUndefined;
+    final TypeName typeAllDefined;
+    if (typeArgumentsDefined.build().isEmpty()) {
+      typeAllUndefined = rawSafeBuilderType(d);
+      typeAllDefined = rawSafeBuilderType(d);
+    } else {
+      typeAllUndefined = ParameterizedTypeName.get(
+          rawSafeBuilderType(d), typeArgumentsUndefined.build().toArray(new TypeName[0]));
+      typeAllDefined = ParameterizedTypeName.get(
+          rawSafeBuilderType(d), typeArgumentsDefined.build().toArray(new TypeName[0]));
+    }
+
+    TypeName buildFunctionType = ParameterizedTypeName.get(
+        ClassName.get("java.util.function", "Function"),
+        typeAllUndefined,
+        typeAllDefined);
+
+    MethodSpec.Builder build = MethodSpec.methodBuilder("safeBuild")
+        .addParameter(buildFunctionType, "buildFunction", FINAL)
+        .addModifiers(PUBLIC, STATIC)
+        .returns(valueType(d));
+
+    if (!d.typeVariables().isEmpty()) {
+      build.addTypeVariables(d.typeVariables());
+    }
+
+    return build.addStatement("return buildFunction.apply(new $T()).build()", typeAllUndefined).build();
   }
 
   private MethodSpec fromValue(final Descriptor d) {
@@ -950,6 +1155,18 @@ public final class AutoMatterProcessor extends AbstractProcessor {
     return ParameterizedTypeName.get(raw, d.typeArguments());
   }
 
+  private TypeName safeBuilderType(final Descriptor d) {
+    final ClassName raw = rawSafeBuilderType(d);
+    final List<TypeName> typeArguments = ImmutableList.<TypeName>builder()
+        .addAll(Arrays.asList(d.typeArguments()))
+        .addAll(safetyTypeVariables(d, true))
+        .build();
+    if (typeArguments.isEmpty()) {
+      return raw;
+    }
+    return ParameterizedTypeName.get(raw, typeArguments.toArray(new TypeName[0]));
+  }
+
   private TypeName upperBoundedBuilderType(final Descriptor d) {
     final ClassName raw = rawBuilderType(d);
     if (!d.isGeneric()) {
@@ -968,6 +1185,10 @@ public final class AutoMatterProcessor extends AbstractProcessor {
 
   private ClassName rawBuilderType(final Descriptor d) {
     return ClassName.get(d.packageName(), d.builderName());
+  }
+
+  private ClassName rawSafeBuilderType(final Descriptor d) {
+    return ClassName.get(d.packageName(), d.builderName(), "SafeBuilder");
   }
 
   private ClassName rawValueType(final Descriptor d) {

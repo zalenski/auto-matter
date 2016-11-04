@@ -21,5 +21,8 @@ public class SimpleExample {
         .build();
 
     out.println("modified: " + modified);
+
+    Foobar safeFoobar = FoobarBuilder.SafeBuilder.safeBuild(builder -> builder.bar(3).foo("foo"));
+    out.println("safe: " + safeFoobar);
   }
 }
